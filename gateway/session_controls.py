@@ -189,6 +189,12 @@ class AuthorityConnection:
         authority.events[self.actor.transport_id] = transport
 
     @property
+    def native_host_owner(self):
+        """True for a native ticket issued directly to the OS owner."""
+        from gateway.owner_identity import host_owner_subject
+        return self.native_owner and self._identity.get('user_id') == host_owner_subject()
+
+    @property
     def host_scoped(self):
         """A host-scoped grant (the Desktop's shared-primary socket, the dashboard gate) acts for
         every profile this process serves; any other grant is bound to its own profile."""

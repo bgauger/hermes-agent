@@ -105,6 +105,10 @@ class CanonicalBotCancelParams(Params):
     profile: str | None = None
     id: str
     author_id: str | None = None
+    admission_id: str | None = None
+    session_id: str | None = None
+    run_id: str | None = None
+    run_scope: str | None = None
 
 
 class CanonicalBotCancelResult(Result):

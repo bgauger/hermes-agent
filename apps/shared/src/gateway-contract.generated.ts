@@ -5610,6 +5610,10 @@ export interface CanonicalBotCancelParams {
   profile?: string | null
   id: string
   author_id?: string | null
+  admission_id?: string | null
+  session_id?: string | null
+  run_id?: string | null
+  run_scope?: string | null
 }
 /** ``gateway/session_bot_cancel.py``: ``cancelled`` (withdrawn before it ran, or its pending automatic retry withdrawn), ``stopping`` (its running turn was told to stop), or ``finished`` (nothing left to cancel); ``receipt_status`` is the delivery receipt's status after it. */
 export interface CanonicalBotCancelResult {

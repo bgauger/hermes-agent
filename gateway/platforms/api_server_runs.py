@@ -328,7 +328,7 @@ def _set_run_status(self, run_id: str, status: str, **fields: Any) -> dict[str, 
         status != previous_status
         or status in TERMINAL_STATUSES
         or bool(field_names & {
-            "output", "error", "usage", "pending_steer", "session_id", "shutdown_requested_at"}))
+            "output", "error", "usage", "pending_steer", "session_id", "delivery_id", "shutdown_requested_at"}))
     if run_id in self._run_idempotency_ids and should_persist:
         try:
             self._run_idempotency_store.update_status(run_id, current)
@@ -340,6 +340,8 @@ def _set_run_status(self, run_id: str, status: str, **fields: Any) -> dict[str, 
 def _mark_shutdown_interrupted_runs(self, run_ids) -> None:
     """Publish the shutdown outcome before cooperative interruption can race teardown."""
     for run_id in run_ids:
+        if self._run_statuses.get(run_id, {}).get("delivery_id"):
+            continue  # Shutdown can drop the observer while its owner still holds the turn.
         self._shutdown_interrupted_run_ids.add(run_id)
         self._set_run_status(
             run_id,
@@ -472,14 +474,14 @@ def _durable_run_status(self, request: web.Request, run_id: str) -> dict[str, An
         if run_id in self._run_idempotency_ids:
             scope = self._run_idempotency_scope(request)
             self._run_idempotency_store.extend_retention(scope, run_id, _room_retention_until(request))
-        return status
+        return _project_live_run(self, status)
     scope = self._run_idempotency_scope(request)
     record = self._run_idempotency_store.status_for_run(
         scope, run_id, retention_until=_room_retention_until(request))
     if record is None:
         return None
     status = dict(record["status"])
-    if status.get("status") not in TERMINAL_STATUSES and not _owner_alive(
+    if not status.get("delivery_id") and status.get("status") not in TERMINAL_STATUSES and not _owner_alive(
         int(record.get("owner_pid") or 0), int(record.get("owner_started") or 0)):
         status.update(
             status="interrupted", error="The gateway restarted before this run settled.",
@@ -488,7 +490,25 @@ def _durable_run_status(self, request: web.Request, run_id: str) -> dict[str, An
     self._run_statuses[run_id] = status
     self._run_idempotency_ids.add(run_id)
     self._run_owners[run_id] = scope
-    return status
+    return _project_live_run(self, status)
+
+
+def _project_live_run(self, status):
+    state = status["status"]
+    unverified_cancel = state == "cancelled" and not status.get("admission_id")
+    if not status.get("delivery_id") or (state in TERMINAL_STATUSES and not unverified_cancel):
+        return status
+    from gateway.platforms.api_server_bot_chat import live_run_projection
+
+    fields = live_run_projection(self, status)
+    if fields["status"] in TERMINAL_STATUSES:
+        return self._set_run_status(status["run_id"], fields.pop("status"), **fields)
+    if unverified_cancel:
+        # Older adapters closed the observer as cancelled. The owner's receipt
+        # can supersede that verdict, including its obsolete terminal flags.
+        status = {key: value for key, value in status.items()
+                  if key not in {"completed", "partial", "interrupted"}}
+    return {**status, **fields}
 
 
 def _resolve_conversation_history(
@@ -881,7 +901,7 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
     # Under session authority the same call admits the turn to the Bot Chat's own FIFO, which is
     # why it is decided BEFORE ``admit_api_turn`` would bind the chat as an API conversation.
     admitted = await self._admit_to_live_bot_chat(session_id, user_message, turn_author) if selected_session_id else None
-    _retarget_to_delivered_chat(self, launch, admitted)
+    _bind_live_delivery(self, launch, admitted)
     if admitted is None and getattr(self.gateway_runner, 'session_authority', None) is not None:
         refused = await _admit_run_to_authority(
             self, launch, run_id, session_history_delivery, _declared_selected,
@@ -891,7 +911,7 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
     self._activate_admitted_request()
     if admitted is not None:
         task = self._active_run_tasks[run_id] = asyncio.create_task(
-            _execute_run_via_live_owner(self, launch, *admitted, _api_server=_api_server))
+            _execute_run_via_live_owner(self, launch, *admitted))
     else:
         task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
     with suppress(TypeError):
@@ -901,13 +921,15 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
     return _accepted_response(run_id, "started", gateway_session_key, replayed=False)
 
 
-def _retarget_to_delivered_chat(self, launch: _RunLaunch, admitted) -> None:
-    """The owner moved an API-held "Bot Chat" title aside and the turn landed in the local chat it
-    minted (MSG-21): the run record (and its idempotency replay) names that chat, not the old row."""
-    delivered = admitted[1].get("session_id") if admitted is not None else None
-    if delivered and delivered != launch.session_id:
-        launch.session_id = delivered
-        self._set_run_status(launch.run_id, "queued", session_id=delivered)
+def _bind_live_delivery(self, launch, admitted) -> None:
+    if admitted is None:
+        return
+    _, record = admitted
+    # The owner may move an API-held title aside. Persist the actual target and its
+    # admission before acknowledging the run, so a new observer can still control it.
+    launch.session_id = record.get("session_id") or launch.session_id
+    self._set_run_status(launch.run_id, "queued", session_id=launch.session_id,
+                         delivery_id=record["delivery_id"], admission_id=record.get("admission_id"))
 
 
 def _run_usage(agent) -> dict[str, int]:
@@ -1013,54 +1035,22 @@ def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[di
     return _approval_notify
 
 
-async def _execute_run_via_live_owner(self, run: _RunLaunch, home, record: dict[str, Any], *, _api_server) -> None:
-    """Drive a run whose turn a live Bot Chat owner is executing, from that owner's mailbox receipt.
-
-    The receipt is the only truth about the turn: ``settled`` completes the run with the owner's
-    reply, a failed receipt fails it with the owner's classified reason. ``/stop`` cannot reach the
-    owner's turn — the mailbox has no recall once a record is claimed — so a stop ends this run
-    as ``cancelled`` while the chat finishes on its own; the stop handler already reports that a
-    run without an in-process agent is not interruptible here.
-    """
-    from gateway.platforms.api_server_bot_chat import await_live_delivery
+async def _execute_run_via_live_owner(self, run: _RunLaunch, home, record: dict[str, Any]) -> None:
+    """Publish the Bot Chat owner's outcome; the observer has no execution to cancel."""
+    from gateway.platforms.api_server_bot_chat import await_live_delivery, live_run_fields
 
     run_id = run.run_id
-    delivery_id = record["delivery_id"]
-
-    def _finish(status: str, **fields: Any) -> None:
-        if run_id in self._shutdown_interrupted_run_ids:
-            # Shutdown already published "interrupted"; the cancel that follows must not
-            # rewrite it as a plain "cancelled" (same guard as the native _execute_run).
-            status, fields = "interrupted", {"error": "Gateway shutdown interrupted the run."}
-        self._set_run_status(run_id, status, **fields, last_event=f"run.{status}")
-        with suppress(Exception):
-            run.put_event(_run_event(run_id, f"run.{status}", **fields))
-
     try:
-        self._set_run_status(run_id, "running", delivery_id=delivery_id)
-        record = await await_live_delivery(
-            self, home, record, None, should_stop=lambda: run_id in self._stopping_run_ids)
-        if record["status"] in ("queued", "claimed"):
-            _finish("cancelled", completed=False, partial=False, interrupted=True)
-            return
-        if record["status"] == "settled":
-            _finish("completed", completed=True, partial=False, interrupted=False,
-                    output=record.get("reply") or "", usage={})
-        elif record["status"] == "cancelled":
-            _finish("cancelled", completed=False, partial=False, interrupted=True)
-        else:
-            _finish("failed", completed=False, partial=False, interrupted=False,
-                    error=record.get("error") or f"Bot Chat delivery {record['status']}",
-                    **({"reason": record["reason"]} if record.get("reason") else {}))
-    except asyncio.CancelledError:
-        _finish("cancelled", completed=False, partial=False, interrupted=True)
-        raise
-    except Exception as exc:
-        logger.exception("[api_server] run %s (live Bot Chat) failed", run_id)
-        _finish("failed", completed=False, partial=False, interrupted=False, error=str(exc))
+        record = await await_live_delivery(self, home, record, None)
+        fields = live_run_fields(record, self._run_statuses[run_id]["status"])
+        status = fields.pop("status")
+        self._set_run_status(run_id, status, **fields, last_event=f"run.{status}")
+        run.put_event(_run_event(run_id, f"run.{status}", **fields))
+    except Exception as exc:  # health: allow BLE001 -- observer failure cannot settle the owner
+        logger.warning("[api_server] lost Bot Chat receipt observer for %s: %s", run_id, type(exc).__name__)
     finally:
         with suppress(Exception):
-            run.put_event(None)  # sentinel: close the SSE stream
+            run.put_event(None)
         _retire_live_run(self, run_id)
 
 
@@ -1498,10 +1488,9 @@ async def _handle_stop_run(self, request: web.Request, *, _api_server) -> web.Re
         self, request, _api_server=_api_server, permission="stop", active_fallback=True)
     if err is not None:
         return err
-    # A run whose turn a live Bot Chat owns (``_execute_run_via_live_owner``) is not an API
-    # admission: its stop is the legacy in-process task cancel below, never ``stop_run``.
-    if (getattr(self.gateway_runner, 'session_authority', None) is not None
-            and not (task is not None and status.get("delivery_id"))):
+    if status.get("delivery_id"):
+        return await _stop_live_owner_run(self, run_id, status)
+    if getattr(self.gateway_runner, 'session_authority', None) is not None:
         from gateway.platforms.api_server_authority_runs import stop_run, store_error_response
         try:
             return web.json_response(await stop_run(self, run_id))
@@ -1522,6 +1511,22 @@ async def _handle_stop_run(self, request: web.Request, *, _api_server) -> web.Re
         # run on the same session_id keeps its own); no-op if the run already finished.
         _api_server._reap_disconnected_agent_processes(agent, source="api_server_run_stop")
     return web.json_response({"run_id": run_id, "status": "stopping"})
+
+
+async def _stop_live_owner_run(self, run_id, status):
+    from gateway.platforms.api_server_bot_chat import stop_live_run
+
+    if status["status"] in TERMINAL_STATUSES:
+        return web.json_response(status)
+    if not status.get("admission_id") or status["status"] == "unknown":
+        return web.json_response({**status, "status": "unknown"})
+    self._set_run_status(run_id, "stopping", admission_id=status["admission_id"], last_event="run.stopping")
+    try:
+        await stop_live_run(self, status)
+    except Exception as exc:  # health: allow BLE001 -- the remote control may lose its ACK
+        # A repeat inspects the exact receipt before it can send another stop.
+        logger.warning("[api_server] Bot Chat stop outcome unknown for %s: %s", run_id, type(exc).__name__)
+    return web.json_response(_project_live_run(self, self._run_statuses[run_id]))
 
 
 async def _handle_resolve_unknown_run(

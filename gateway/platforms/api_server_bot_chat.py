@@ -10,12 +10,14 @@ session as an API conversation (``run_api_turn``) would be a second writer and i
 """
 import asyncio
 import logging
+from pathlib import Path
+import sqlite3
 from types import SimpleNamespace
 import uuid
 
 from gateway.platforms.api_server_store import authority_store
 from gateway.session_contract import SessionActor
-from persistence import AuthorityRefusal
+from persistence import STORE_FAILURES, AuthorityRefusal
 
 logger = logging.getLogger(__name__)
 
@@ -226,3 +228,85 @@ async def _owner_published(authority, record, deadline):
 def _receipt(authority, record):
     from gateway.session_bot import _result
     return {**record, **_result(authority, record)}
+
+
+def _bound_delivery(adapter, status):
+    """Read the run's pinned receipt in the request's routed profile."""
+    from gateway.session_bot import _canonical_record_error
+    from hermes_constants import get_hermes_home
+    from tools.bot_live_delivery import read_delivery_result
+
+    authority = _authority(adapter.gateway_runner)
+    home = authority_store(authority).scope.profile_dir if authority is not None else get_hermes_home().resolve()
+    key = status['delivery_id']
+    record = read_delivery_result(home, key)
+    if (record is not None and not _canonical_record_error(Path(f'{key}.json'), record)
+            and record['profile_home'] == str(home) and record['session_id'] == status.get('session_id')
+            and status.get('admission_id') in (None, record['admission_id'])):
+        return authority, home, record
+    return authority, home, None
+
+
+def live_run_fields(record, previous):
+    """Project only receipt evidence. Losing the observer says nothing about the executor."""
+    delivery_status = record['status']
+    if delivery_status in _PENDING:
+        state = 'stopping' if previous == 'stopping' else {'queued': 'queued', 'claimed': 'running'}[delivery_status]
+        return {'status': state}
+    if delivery_status == 'settled':
+        return dict(status='completed', completed=True, partial=False, interrupted=False,
+                    output=record.get('reply') or '', usage={})
+    if delivery_status == 'cancelled':
+        return dict(status='cancelled', completed=False, partial=False, interrupted=True)
+    if delivery_status == 'failed':
+        return dict(status='failed', completed=False, partial=False, interrupted=False,
+                    error=record.get('error') or 'Bot Chat delivery failed',
+                    **({'reason': record['reason']} if record.get('reason') else {}))
+    return {'status': 'unknown'}
+
+
+def live_run_projection(adapter, status):
+    """Recover status from the owner even when no API observer task exists."""
+    from gateway.session_bot import _delivery_result
+    from gateway.session_persistence import authority_persistence
+
+    try:
+        authority, _, record = _bound_delivery(adapter, status)
+        fields = {'status': 'unknown'}
+        if record is not None:
+            current = _delivery_result(authority, record) if authority is not None else record
+            fields = live_run_fields(current, status['status'])
+            fields['admission_id'] = record['admission_id']
+            if retry_id := current.get('retry_admission_id'):
+                fields['retry_admission_id'] = retry_id
+            if authority is not None:
+                row = authority_persistence(authority).admissions.get(
+                    admission_id=retry_id or record['admission_id'])
+                if row is not None:
+                    if row.status == 'unknown':
+                        fields = {'status': 'unknown', 'admission_id': record['admission_id']}
+                        if retry_id:
+                            fields['retry_admission_id'] = retry_id
+                    fields['execution_generation'] = row.generation
+    except (AuthorityRefusal, sqlite3.Error, OSError, ValueError, *STORE_FAILURES):
+        fields = {'status': 'unknown'}
+    fields['last_event'] = f"run.{fields['status']}"
+    return fields
+
+
+async def stop_live_run(adapter, status):
+    """Stop the exact admitted delivery through its owner, then inspect settlement."""
+    from gateway.session_authorities import served_profile_name
+    from gateway.session_bot_cancel import cancel
+    from tools.bot_live_delivery import _authority_rpc
+
+    authority, home, record = await asyncio.to_thread(_bound_delivery, adapter, status)
+    if record is None:
+        raise AuthorityRefusal('unknown_execution')
+    params = dict(id=record['delivery_id'], profile=served_profile_name(home),
+                  admission_id=record['admission_id'], session_id=record['session_id'],
+                  author_id=(record.get('author') or {}).get('id'))
+    if authority is not None:
+        await cancel(SimpleNamespace(authority=authority, actor=None), params, peer=True)
+    else:
+        await asyncio.to_thread(_authority_rpc, home, 'bot_relay.cancel', params)

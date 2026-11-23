@@ -83,12 +83,13 @@ def build_browser_env() -> dict:
 
 def shares_bot_desktop_browser(session_info: dict[str, Any]) -> bool:
     """Every LOCAL session is a browser Hermes launched with this profile's Bot Desktop DISPLAY, so it is the
-    screen a human who took over is typing into. Cloud / user-supplied CDP sessions are another browser. A
+    screen a human who took over is typing into. Other endpoints have no verified display provenance. A
     human lease with the screen already gone still fences (computer_use does the same)."""
     if not (session_info.get("features") or {}).get("local"):
         return False
     from tools.bot_desktop import lease as _bd_lease, runtime as _bd_runtime
-    return bool(_bd_runtime.published_env().get("DISPLAY")) or _bd_lease.human_holds()
+    return (bool(_bd_runtime.published_env().get("DISPLAY")) or _bd_lease.human_holds()
+            or _bd_lease.explicit_release_applies())
 
 
 def human_holds_shared_browser(session_info: dict[str, Any]) -> bool:
@@ -101,19 +102,19 @@ def human_holds_shared_browser(session_info: dict[str, Any]) -> bool:
 
 
 def run_fenced(session_info: dict[str, Any], fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
-    """Run ``fn`` under the Bot Desktop lease fence when ``session_info`` is the bot's LOCAL browser.
+    """Fence every route under explicit release, or the shared local browser under the legacy policy.
 
     While a human holds the lease every action AND read against it is refused (the page may show their
     credential); the fence brackets the whole run so a takeover mid-command also voids the result.
     """
-    if not shares_bot_desktop_browser(session_info):
-        return fn()
     from tools.bot_desktop import lease as _bd_lease
+    if not (_bd_lease.explicit_release_applies() or shares_bot_desktop_browser(session_info)):
+        return fn()
     try:
-        admitted = _bd_lease.assert_agent_may_act()
+        with _bd_lease.admitted_action() as admitted:
+            result = fn()
     except _bd_lease.HumanHasControl as e:
         return {"success": False, "error": str(e), "code": "human_has_control"}
-    result = fn()
     if _bd_lease.get().epoch != admitted.epoch:
         return {"success": False, "code": "human_has_control",
                 "error": "A human took over the bot's screen while this browser command ran; its result was "
@@ -323,7 +324,9 @@ def _reuse_or_evict(cache_key: str) -> Optional[dict[str, Any]]:
     if not _lifecycle.session_has_expired(existing) and not _backend_dead(existing):
         return existing
     logger.info("Replacing expired or dead browser session for %s", cache_key)
-    _lifecycle.cleanup_single_session(cache_key)
+    if _lifecycle.cleanup_single_session(cache_key) is False:
+        from tools.bot_desktop.lease import HumanHasControl
+        raise HumanHasControl("Browser replacement was interrupted by a desktop takeover.")
     _lifecycle.update_session_activity(cache_key)  # teardown dropped the entry; track the replacement
     with _cleanup_lock:
         replacement = _active_sessions.get(cache_key)  # another thread may already have rebuilt it

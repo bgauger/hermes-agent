@@ -376,6 +376,11 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
     WebSocket instead — the only reliable way to evaluate inside an iframe where fresh per-call connections
     hit signed-URL expiry (Browserbase). Both paths share the same private-page/SSRF guard. Returns JSON
     ``{"success": True, "method", "result"}`` or ``{"error": ...}``."""
+    from tools.bot_desktop.lease import explicit_release_applies
+
+    if explicit_release_applies():
+        return tool_error("browser_cdp is unavailable with Bot Desktop explicit release. Use browser_exec.",
+                          code="exclusive_desktop_route")
     effective_task_id = task_id or "default"
 
     if frame_id:

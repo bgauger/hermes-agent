@@ -166,7 +166,7 @@ async def _bridge(ws: WebSocket, info: dict) -> None:
     def _refresh_allowed(lease=None) -> None:
         if lease is None:
             lease = _lease.get(profile_key=profile_home)
-        allowed["input"] = lease.holder == _lease.HUMAN and lease.viewer_id == viewer_id
+        allowed["input"] = _lease.permits_input(lease, viewer_id)
         allowed["at"] = loop.time()
 
     def _may_send_input() -> bool:
@@ -184,7 +184,7 @@ async def _bridge(ws: WebSocket, info: dict) -> None:
 
     rfb_filter = RfbClientFilter(_may_send_input)
 
-    viewer_closed = asyncio.Event()
+    closing_epoch: int | None = None
     activity_file = Path(profile_home) / "bot-desktop" / "activity"
     stamped = {"at": 0.0}
 
@@ -207,24 +207,34 @@ async def _bridge(ws: WebSocket, info: dict) -> None:
             await ws.send_bytes(chunk)  # awaiting the send is the backpressure toward Xvnc
 
     async def ws_to_rfb() -> None:
+        nonlocal closing_epoch
         while True:
             message = await ws.receive()
             if message.get("type") == "websocket.disconnect":
                 # 1000/1001 = the viewer closed the window; anything else is a dropped link.
                 if message.get("code") in _CLEAN_CLOSE:
-                    viewer_closed.set()
+                    closing = _lease.get(profile_key=profile_home)
+                    if closing.holder == _lease.HUMAN and closing.viewer_id == viewer_id:
+                        closing_epoch = closing.epoch
                 return
             data = message.get("bytes")
             if data is None:
                 await ws.close(code=_CLOSE_PROTOCOL, reason="RFB is binary")
                 return
             try:
-                allowed = rfb_filter.feed(data)
+                # The write-ahead record survives a dropped relay or a gateway exit. Neither
+                # write() nor drain() observes processing by Xvnc or the desktop input executor.
+                with _lease.input_snapshot(profile_home) as snapshot:
+                    _refresh_allowed(snapshot)
+                    forwarded = rfb_filter.feed(data)
+                    if forwarded:
+                        if rfb_filter.forwarded_input:
+                            _lease.record_unconfirmed_input(profile_home, snapshot)
+                        writer.write(forwarded)
             except ValueError as exc:
                 await ws.close(code=_CLOSE_PROTOCOL, reason=str(exc)[:100])
                 return
-            if allowed:
-                writer.write(allowed)
+            if forwarded:
                 await writer.drain()  # backpressure toward the browser
 
     async def watch_eviction() -> None:
@@ -253,11 +263,8 @@ async def _bridge(ws: WebSocket, info: dict) -> None:
             pass
         if relay is not None:
             relay.kill()  # the exec client; Xvnc inside the sandbox stays up
-        # Closing the viewer window hands control back. A DROPPED link (laptop lid, Wi-Fi, 1006)
-        # keeps the human's exclusion: they may be mid-login on that screen and the agent must not
-        # resume into it. The Desktop reconnects into the same lease, or the human hands back.
-        if viewer_closed.is_set() and _lease.viewer_may_send_input(viewer_id, profile_key=profile_home):
-            _lease.release(viewer_id, profile_key=profile_home)
+        if closing_epoch is not None:
+            _lease.release(viewer_id, profile_key=profile_home, epoch=closing_epoch, implicit=True)
         try:
             await ws.close()
         except Exception:  # already closed by the peer or by an eviction

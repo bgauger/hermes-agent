@@ -66,22 +66,30 @@ def test_computer_use_refuses_every_action_while_a_human_holds_the_screen(monkey
     assert lease.get().holder == lease.AGENT
 
 
-def test_lease_authority_is_shared_across_processes(tmp_path):
+@pytest.mark.parametrize("explicit_release", [False, True])
+def test_lease_authority_is_shared_across_processes(tmp_path, explicit_release):
     """The gateway that streams the screen and the process running the agent are different processes;
     a human takeover in one must refuse actions in the other."""
     import os
     import subprocess
     import sys
+    from hermes_constants import get_hermes_home
 
-    lease.acquire("desktop-viewer")
+    if explicit_release:
+        (get_hermes_home() / "config.yaml").write_text(
+            "bot_desktop:\n  explicit_release: true\n", encoding="utf-8",
+        )
+    held = lease.acquire("desktop-viewer")
+    assert held.explicit_release is explicit_release
     probe = (f"import sys; sys.path.insert(0, {os.getcwd()!r})\n"
              "from tools.bot_desktop import lease\n"
              "try:\n    lease.assert_agent_may_act(); print('AGENT')\n"
              "except lease.HumanHasControl:\n    print('HUMAN')\n"
+             "print(lease.release('desktop-viewer', implicit=True).holder)\n"
              "lease.release('desktop-viewer')\n")
     out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, encoding="utf-8", timeout=30,
                          stdin=subprocess.DEVNULL, env={**os.environ, "HERMES_HOME": os.environ["HERMES_HOME"]}, check=False)
-    assert out.stdout.strip() == "HUMAN", out.stderr
+    assert out.stdout.splitlines() == ["HUMAN", lease.HUMAN if explicit_release else lease.AGENT], out.stderr
     assert lease.get().holder == lease.AGENT, "the other process's release is visible here"
 
 
@@ -211,3 +219,109 @@ def test_no_op_transitions_do_not_bump_the_epoch():
     again = lease.acquire("v1")
     assert again.epoch == got.epoch and again.reason == "log in please" and again.since == got.since
     assert lease.acquire("v2").epoch == got.epoch + 1  # a different viewer IS a transition
+
+
+@pytest.mark.platforms("posix")
+def test_cua_takeover_waits_for_executor_before_rfb_input(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from pathlib import Path
+    from threading import Event
+
+    from hermes_constants import get_hermes_home
+    from tools.computer_use import tool
+
+    Path(get_hermes_home(), "config.yaml").write_text("bot_desktop:\n  explicit_release: true\n")
+    entered, finish = Event(), Event()
+    effects = []
+
+    def dispatch(*args, **kwargs):
+        entered.set()
+        assert finish.wait(5)
+        effects.append("last agent effect")
+        return json.dumps({"ok": True, "secret": "discard me"})
+
+    monkeypatch.setattr(tool, "_new_backend", lambda mode: NoopBackend())
+    monkeypatch.setattr(tool, "_dispatch", dispatch)
+    viewer = RfbClientFilter(lambda: lease.viewer_may_send_input("owner"))
+    viewer.feed(_HANDSHAKE)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(tool.handle_computer_use, {"action": "capture"})
+        try:
+            assert entered.wait(5)
+            pending = lease.acquire("owner")
+            assert pending.pending and lease.public_view(pending)["viewer_hash"] is None
+            assert viewer.feed(_KEY) == b""
+            assert json.loads(tool.handle_computer_use({"action": "capture"}))["code"] == "human_has_control"
+            assert lease.release("owner", implicit=True).pending
+            assert effects == []
+        finally:
+            finish.set()
+        assert json.loads(future.result(timeout=5))["code"] == "human_has_control"
+    assert effects == ["last agent effect"]
+    assert viewer.feed(_KEY) == _KEY
+    assert lease.release("owner", epoch=pending.epoch).holder == lease.HUMAN
+    assert lease.release("owner").holder == lease.AGENT
+
+
+@pytest.mark.platforms("posix")
+def test_process_exit_does_not_clear_executor_activity():
+    import os
+    import select
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from hermes_constants import get_hermes_home
+
+    Path(get_hermes_home(), "config.yaml").write_text("bot_desktop:\n  explicit_release: true\n")
+    daemon_code = r"""
+import sys
+assert sys.stdin.readline() == "start\n"
+print("active", flush=True)
+assert sys.stdin.readline() == "settle\n"
+"""
+    client_code = r"""
+import os, sys
+from tools.bot_desktop import lease
+with lease.admitted_action():
+    os.write(int(sys.argv[1]), b"start\n")
+    os._exit(0)
+"""
+    env = {**os.environ, "HERMES_HOME": str(get_hermes_home())}
+    with subprocess.Popen([sys.executable, "-c", daemon_code], stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, env=env) as daemon:
+        try:
+            fd = daemon.stdin.fileno()
+            subprocess.run([sys.executable, "-c", client_code, str(fd)], check=True,
+                           timeout=10, env=env, pass_fds=(fd,))
+            assert select.select([daemon.stdout], [], [], 5)[0]
+            assert daemon.stdout.readline() == b"active\n"
+            assert daemon.poll() is None
+            assert lease.acquire("owner").pending
+            assert not lease.viewer_may_send_input("owner")
+            other_client = subprocess.run(
+                [sys.executable, "-c",
+                 "from tools.bot_desktop import lease\nwith lease.admitted_action(): pass"],
+                capture_output=True, check=False, timeout=10, env=env,
+            )
+            assert other_client.returncode == 1
+            assert b"HumanHasControl" in other_client.stderr
+        finally:
+            daemon.communicate(input=b"settle\n", timeout=5)
+        assert daemon.returncode == 0
+    # Daemon exit exists in the test's observer but no completion reached Hermes.
+    assert lease.release().holder == lease.AGENT
+    assert lease.acquire("replacement").pending
+    assert lease.release("owner").holder == lease.HUMAN
+
+
+@pytest.mark.platforms("posix")
+def test_persisted_explicit_lease_without_drain_evidence_stays_pending(tmp_path):
+    home = str(tmp_path)
+    path = lease._path(home)
+    path.parent.mkdir()
+    path.write_text('{"holder":"human","viewer_id":"prior","epoch":7,"explicit_release":true}')
+    assert not lease.viewer_may_send_input("prior", profile_key=home)
+    assert lease.acquire("replacement", profile_key=home).pending
+    assert lease.release("prior", profile_key=home).pending
+    assert lease.release(profile_key=home).handback_pending

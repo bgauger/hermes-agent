@@ -37,10 +37,8 @@ from hermes_cli.cli_commands_session_tools import (
     _dim_line, _gt, _lines, _pr, _probe, _rollback_kept, _save, _say_block, _shlex_args, _t, _tn)
 from hermes_cli.cli_session_switch import (
     _end_current_session, _sync_agent_to_session)
-from hermes_cli.browser_connect import (
-    DEFAULT_BROWSER_CDP_URL, discover_local_cdp_url, find_free_debug_port, is_browser_debug_ready,
-    launch_chrome_debug, local_port_in_use, manual_chrome_debug_command)
-from hermes_cli.cli_browser_gateway import _normalize_cdp_url
+from hermes_cli.browser_connect import DEFAULT_BROWSER_CDP_URL, discover_local_cdp_url, is_browser_debug_ready
+from hermes_cli.cli_browser_gateway import launch_default_cdp_browser, _normalize_cdp_url
 from hermes_cli.cli_commands_handoff import CLIHandoffMixin, _db_unavailable_line
 
 
@@ -246,41 +244,13 @@ def _print_lightpanda_engine_status() -> None:
           else f"   {_t('browser.binary_not_found', hint=LIGHTPANDA_INSTALL_HINT)}")
 
 
-def _launch_default_cdp_browser(port: int):
-    """Launch a local debug browser for the default CDP URL; returns the discovered CDP url or
-    None (after printing what went wrong / how to launch manually)."""
-    import platform as _plat
-    launch_port = port
-    if local_port_in_use(port):
-        launch_port = find_free_debug_port(port)
-        _pr(f"   {_t('browser.port_occupied', port=port)}",
-            f"     {_t('browser.port_occupied_detail', launch_port=launch_port)}")
-    else:
-        print(f"   {_t('browser.launching')}")
-    launch = launch_chrome_debug(launch_port, _plat.system())
-    if not launch.launched:
-        print(f"   {_t('browser.launch_failed')}")
-        if launch.hint:
-            print(f"     {launch.hint}")
-        chrome_cmd = manual_chrome_debug_command(launch_port, _plat.system())
-        if chrome_cmd:
-            _pr(f"     {_t('browser.launch_manually')}", f"     {chrome_cmd}")
-        else:
-            print(f"     {_t('browser.no_executable')}")
-        return None
-    for _wait in range(10):  # wait for the DevTools discovery endpoint to come up
-        found = discover_local_cdp_url(launch_port, timeout=1.0)
-        if found:
-            print(f"   {_t('browser.launched', port=launch_port)}")
-            return found
-        time.sleep(0.5)
-    _pr(f"   {_t('browser.not_responding', port=launch_port)}", f"     {_t('browser.try_again')}")
-    return None
-
-
 def _browser_connect(cli, cdp_url: str) -> None:
     """/browser connect [url] — validate the CDP URL, find or launch a debug browser, then
     point the browser tools at it (BROWSER_CDP_URL) and tell the model."""
+    from tools.bot_desktop.lease import explicit_release_applies
+
+    if explicit_release_applies():
+        return _say_block("Live browser connection changes are unavailable with Bot Desktop explicit release.")
     normalized = _normalize_cdp_url(cdp_url)
     if normalized is None:
         return
@@ -298,7 +268,7 @@ def _browser_connect(cli, cdp_url: str) -> None:
     if found:
         print(f"   {_t('browser.already_listening', url=found)}")
     elif is_default:
-        found = _launch_default_cdp_browser(port)
+        found = launch_default_cdp_browser(port)
     else:
         print(f"   {_t('browser.port_unreachable', port=port, url=cdp_url)}")
     if not found:
@@ -322,6 +292,10 @@ def _browser_connect(cli, cdp_url: str) -> None:
 
 
 def _browser_disconnect(cli) -> None:
+    from tools.bot_desktop.lease import explicit_release_applies
+
+    if explicit_release_applies():
+        return _say_block("Live browser connection changes are unavailable with Bot Desktop explicit release.")
     if not os.environ.get("BROWSER_CDP_URL", "").strip():
         return _say_block(_t("browser.already_default"))
     os.environ.pop("BROWSER_CDP_URL", None)

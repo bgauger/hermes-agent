@@ -93,6 +93,10 @@ def _reap_profile_browsers() -> None:
 
 
 def _browser_connect(rid, params: dict) -> dict:
+    from tools.bot_desktop.lease import explicit_release_applies
+
+    if explicit_release_applies():
+        return _err(rid, 5031, "Live browser connection changes are unavailable with Bot Desktop explicit release.")
     import platform
     from hermes_cli.browser_connect import DEFAULT_BROWSER_CDP_URL
     from tools.browser_session_cdp import set_live_cdp_override
@@ -159,6 +163,11 @@ def _browser_connect(rid, params: dict) -> dict:
 def _browser_disconnect(rid) -> dict:
     # Reap, drop this profile's override, reap again — same swap window as ``_browser_connect``.
     from tools.browser_session_cdp import set_live_cdp_override
+
+    from tools.bot_desktop.lease import explicit_release_applies
+
+    if explicit_release_applies():
+        return _err(rid, 5031, "Live browser connection changes are unavailable with Bot Desktop explicit release.")
 
     def reap() -> None:
         with contextlib.suppress(Exception):

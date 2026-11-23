@@ -401,7 +401,13 @@ def tool_placement() -> str:
     if where.where == placement.GATEWAY:
         return placement.GATEWAY
     if not sandbox_screen_running() or not published_env().get("DISPLAY"):
-        start()
+        from tools.bot_desktop.lease import executor_outcome_unknown
+        try:
+            start()
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            # A failed readiness check or lost relay can leave a remote launch running.
+            executor_outcome_unknown()
+            raise
     return placement.TERMINAL
 
 
@@ -481,7 +487,11 @@ def _idle_due(launcher: Optional[tuple[int, float]]) -> Optional[float]:
         return None
     from tools.bot_desktop import lease as _bd_lease
     abandoned_after = max(limit * HUMAN_LEASE_ABANDONED_WINDOWS, HUMAN_LEASE_ABANDONED_MIN_S)
-    if _bd_lease.get().holder == _bd_lease.HUMAN and idle < abandoned_after:
+    held = _bd_lease.get()
+    if held.holder == _bd_lease.HUMAN and (
+        held.explicit_release or idle < abandoned_after
+        or (held.pending and _bd_lease.explicit_release_enabled())
+    ):
         return None
     return idle
 
@@ -516,7 +526,7 @@ def stop_if_idle(launcher: Optional[tuple[int, float]] = None) -> bool:
         # screen ("a human has control"); only the lease generation judged abandoned goes, so any takeover
         # since (another viewer, or the same one handing back and taking over again) is kept.
         try:
-            _bd_lease.release(held.viewer_id, epoch=held.epoch)
+            _bd_lease.release(held.viewer_id, epoch=held.epoch, implicit=True)
         except OSError as exc:  # the screen is already stopped: a full or read-only home must not undo that
             logger.warning("Bot Desktop for profile %s stopped, but its abandoned lease was not released: %s",
                            _profile_name(), exc)

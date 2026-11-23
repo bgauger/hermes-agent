@@ -341,3 +341,63 @@ def test_switch_sandbox_image_decides_only_a_pending_switch(monkeypatch, tmp_pat
     assert decided == [(switch, False)]
     assert resp["result"]["docker_image"] == "nousresearch/hermes-sandbox:desktop"
     assert resp["result"]["running"] is False and "lease" in resp["result"]
+
+
+@pytest.mark.platforms("posix")
+def test_takeover_rpc_reports_pending_until_the_screen_action_settles(monkeypatch, tmp_path, _fresh_lease):
+    from hermes_constants import get_hermes_home
+    from tools.bot_desktop import runtime
+    from tui_gateway import server
+
+    (get_hermes_home() / "config.yaml").write_text("bot_desktop:\n  explicit_release: true\n")
+    monkeypatch.setattr(runtime, "rfb_socket_path", lambda: tmp_path / "rfb.sock")
+    own_viewer = _call(server, "display.observe", {})["result"]["viewer_id"]
+    with _fresh_lease.admitted_action():
+        pending = _call(server, "display.lease.acquire", {"viewer_id": own_viewer})
+        assert pending["error"]["data"]["code"] == "takeover_pending"
+        assert pending["error"]["data"]["lease"]["viewer_hash"] is None
+        assert not _fresh_lease.viewer_may_send_input(own_viewer)
+    ready = _call(server, "display.lease.acquire", {"viewer_id": own_viewer})["result"]["lease"]
+    assert ready["viewer_hash"] == hashlib.sha256(own_viewer.encode()).hexdigest()[:12]
+    assert _call(server, "display.lease.release", {"force": True})["result"]["lease"]["holder"] == "agent"
+
+
+@pytest.mark.platforms("posix")
+def test_handback_reports_pending_and_force_cannot_reopen_admission(monkeypatch, tmp_path, _fresh_lease):
+    from types import SimpleNamespace
+
+    from hermes_cli.subcommands import computer_use_screen
+    from hermes_constants import get_hermes_home
+    from tools.bot_desktop import runtime
+    from tui_gateway import server
+
+    home = get_hermes_home()
+    (home / "config.yaml").write_text("bot_desktop:\n  explicit_release: true\n")
+    monkeypatch.setattr(runtime, "rfb_socket_path", lambda: tmp_path / "rfb.sock")
+    mine = _call(server, "display.observe", {})["result"]["viewer_id"]
+    _call(server, "display.lease.acquire", {"viewer_id": mine})
+    with _fresh_lease.input_snapshot(str(home)) as snapshot:
+        _fresh_lease.record_unconfirmed_input(str(home), snapshot)
+
+    for params in ({"viewer_id": mine}, {"force": True}):
+        response = _call(server, "display.lease.release", params)
+        assert response["error"]["data"]["code"] == "handback_pending"
+        assert response["error"]["data"]["lease"]["holder"] == "human"
+        assert response["error"]["data"]["lease"]["viewer_hash"] is None
+
+    def unexpected_stop(*a, **kw):
+        pytest.fail("stop cannot stand in for a remote input acknowledgement")
+
+    monkeypatch.setattr(runtime, "stop", unexpected_stop)
+    assert _call(server, "display.stop", {"force": True})["error"]["data"]["code"] == "handback_pending"
+    assert computer_use_screen._screen_stop(SimpleNamespace(force=True)) == 1
+
+
+    sid = "synthetic-held-turn"
+    session = {"agent": None, "agent_ready": threading.Event(), "agent_build_started": True,
+               "history": [], "history_lock": threading.RLock(), "running": True, "session_key": sid,
+               "_run_thread": SimpleNamespace(is_alive=lambda: True)}
+    monkeypatch.setitem(server._sessions, sid, session)
+    assert _call(server, "session.interrupt", {"session_id": sid})["result"]["status"] == "interrupted"
+    assert session["_turn_cancel_requested"]
+    assert _fresh_lease.get().handback_pending

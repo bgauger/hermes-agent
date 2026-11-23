@@ -15,6 +15,7 @@ import threading
 from typing import Any, Dict, List, Optional
 
 from hermes_cli._subprocess_compat import windows_hide_flags
+from tools.bot_desktop.lease import executor_outcome_unknown
 from tools.computer_use import cua_backend_driver as _driver
 from tools.computer_use.cua_backend_parse import _extract_tool_result, _mcp_field, _tool_envelope
 
@@ -81,6 +82,7 @@ _UNKNOWN_OUTCOME_MESSAGES = {
 
 def _outcome_unknown(name: str, exc: Exception, code: str) -> dict[str, Any]:
     """Fail-closed ``isError`` result for *code* (see ``_UNKNOWN_OUTCOME_MESSAGES``)."""
+    executor_outcome_unknown()
     message = _UNKNOWN_OUTCOME_MESSAGES[code].format(name=name)
     return _tool_envelope(message, [], {"ok": False, "code": code, "message": message, "operation": name,
                                         "next_step": "fresh_state", "detail": str(exc)}, True, [])
@@ -504,6 +506,7 @@ class _CuaDriverSession:
                            "for recreation before the next call", name)
             return _outcome_unknown(name, e, "timeout_outcome_unknown")
         except Exception as e:
+            executor_outcome_unknown()
             if self._is_transient_daemon_error(e):
                 if name not in self._TRANSPORT_REPLAY_SAFE_TOOLS:
                     self._notify_transport_reset()

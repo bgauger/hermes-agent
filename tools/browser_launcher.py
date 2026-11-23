@@ -773,18 +773,34 @@ def _stop_locked(key: str) -> None:
         return
     record = None if browser.ephemeral else _record_path(browser)
     if record is None:
-        if browser.owned:
-            _terminate(browser.pid, browser.start_time, proc)
-        with _lock:
-            _forget(key, browser)
+        with _browser_teardown_allowed(browser.home_key) as allowed:
+            if not allowed:
+                return
+            if browser.owned:
+                _terminate(browser.pid, browser.start_time, proc)
+            with _lock:
+                _forget(key, browser)
         return
     from tools.browser_launcher_holders import records_lock
-    with records_lock(record.parent):  # the decision and the forget are one step: another key may be the heir
+    with records_lock(record.parent), _browser_teardown_allowed(browser.home_key) as allowed:
+        if not allowed:
+            return
         if _heir_key(browser) is None and _last_holder_out(record, browser):
             _terminate(browser.pid, browser.start_time, proc)
             record.unlink(missing_ok=True)
         with _lock:
             _forget(key, browser, drop_record=False)
+
+
+@contextlib.contextmanager
+def _browser_teardown_allowed(home: Optional[str]):
+    from tools.bot_desktop import lease
+
+    if home and lease.explicit_release_applies(home):
+        with lease.input_snapshot(home) as snapshot:
+            yield snapshot.holder != lease.HUMAN
+    else:
+        yield True
 
 
 def _last_holder_out(record: Path, browser: LaunchedBrowser) -> bool:
@@ -1041,6 +1057,13 @@ def _reap_record(path: Path, home: Optional[str]) -> bool:
         if heir is not None:
             holders.hand_over(path, record, heir)
         return False
+    with _browser_teardown_allowed(record.get("home_key") or home) as allowed:
+        if not allowed:
+            return False
+        return _reap_unheld_record(path, record, home)
+
+
+def _reap_unheld_record(path: Path, record: dict, home: Optional[str]) -> bool:
     reaped = _is_recorded_browser(record, home)
     if reaped:
         _terminate(record["pid"], record.get("start_time"), None)

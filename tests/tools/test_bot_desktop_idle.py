@@ -147,6 +147,25 @@ def test_idle_stop_disabled_by_zero(tmp_path, monkeypatch):
     assert runtime.stop_if_idle() is False and stops == []
 
 
+def test_explicit_release_survives_idle_timeout(tmp_path, monkeypatch):
+    from hermes_constants import get_hermes_home
+
+    sd, stops = _running(monkeypatch, tmp_path)
+    (get_hermes_home() / "config.yaml").write_text(
+        "bot_desktop:\n  explicit_release: true\n", encoding="utf-8",
+    )
+    held = lease.acquire("v1")
+    _age(sd / "env", 3600)
+    assert runtime.stop_if_idle() is False and stops == []
+    assert lease.get() == held
+
+    replacement = lease.acquire("v2")
+    assert lease.release("v1", epoch=held.epoch).epoch == replacement.epoch
+    assert lease.release("v2", epoch=replacement.epoch, implicit=True).holder == lease.HUMAN
+    assert lease.release("v2").holder == lease.AGENT
+    assert runtime.stop_if_idle() is True and stops == [True]
+
+
 def test_an_infinite_idle_window_is_off_and_never_overflows_the_next_check(monkeypatch):
     """``idle_stop_minutes: .inf`` meant "never stop" before the self-stop; the launcher's first-check delay
     is computed from it in start(), where an infinite window raised OverflowError."""

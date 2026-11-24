@@ -49,9 +49,11 @@ class RfbClientFilter:
     def __init__(self, allow_input: Callable[[], bool]) -> None:
         self._allow_input = allow_input
         self._buf = bytearray()
+        self.forwarded_input = False
         self._handshake_left = 12 + 1 + 1  # version + security type + ClientInit(shared flag)
 
     def feed(self, chunk: bytes) -> bytes:
+        self.forwarded_input = False
         self._buf += chunk
         out = bytearray()
         if self._handshake_left:
@@ -73,8 +75,10 @@ class RfbClientFilter:
                 break
             msg = bytes(self._buf[:length])
             del self._buf[:length]
-            if msg[0] in _INPUT_TYPES and not self._allow_input():
-                continue
+            if msg[0] in _INPUT_TYPES:
+                if not self._allow_input():
+                    continue
+                self.forwarded_input = True
             out += msg
         return bytes(out)
 

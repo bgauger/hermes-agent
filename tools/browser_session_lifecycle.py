@@ -144,8 +144,25 @@ def release_session_backend(cache_key: str, session_info: dict[str, Any]) -> Non
         stop_browser(launcher_key)
 
 
-def cleanup_single_session(cache_key: str) -> None:
-    """Tear down one session by its exact key."""
+def cleanup_single_session(cache_key: str) -> bool:
+    """Tear down one session by its exact key. False if admission is closed."""
+    from tools.bot_desktop.lease import HumanHasControl, admitted_action, explicit_release_applies
+    bs = _bs()
+    with bs._cleanup_lock:
+        session_info = bs._active_sessions.get(cache_key) or {}
+        home = bs._session_owner_homes.get(cache_key) or session_info.get("home_key")
+    if explicit_release_applies(home):
+        try:
+            with admitted_action(home):
+                _cleanup_single_session(cache_key)
+        except HumanHasControl:
+            return False
+    else:
+        _cleanup_single_session(cache_key)
+    return True
+
+
+def _cleanup_single_session(cache_key: str) -> None:
     from tools.browser_session_cdp import stop_cdp_supervisor
     stop_cdp_supervisor(cache_key)  # close our WebSocket BEFORE the backend tears the endpoint down
     bs = _bs()
@@ -283,7 +300,11 @@ def _human_holds_shared_browser(cache_key: str) -> bool:
 
 def _force_reap(cache_key: str) -> None:
     """Janitor last resort after repeated failures (#100738): drop the record, release the backend."""
+    from tools.bot_desktop.lease import explicit_release_applies
     from tools.browser_session_cdp import stop_cdp_supervisor
+    if explicit_release_applies():
+        cleanup_single_session(cache_key)
+        return
     stop_cdp_supervisor(cache_key)
     bs = _bs()
     with bs._cleanup_lock:
@@ -299,7 +320,6 @@ def _cleanup_one_inactive(cache_key: str, elapsed: int) -> None:
     try:
         with _session_owner_scope(cache_key):
             cleanup_single_session(cache_key)
-        _forget_session_tracking(cache_key)
     except Exception as e:  # health: allow BLE001 -- counted; force-reaped after MAX_INACTIVITY_CLEANUP_FAILURES
         with bs._cleanup_lock:
             failures = bs._cleanup_failures[cache_key] = bs._cleanup_failures.get(cache_key, 0) + 1
@@ -308,11 +328,8 @@ def _cleanup_one_inactive(cache_key: str, elapsed: int) -> None:
                            cache_key, failures, bs.MAX_INACTIVITY_CLEANUP_FAILURES, e)
             return
         logger.error("Browser cleanup failed %d times for %s; force-reaping: %s", failures, cache_key, e)
-        try:
-            with _session_owner_scope(cache_key):
-                _force_reap(cache_key)
-        finally:
-            _forget_session_tracking(cache_key, activity=False)
+        with _session_owner_scope(cache_key):
+            _force_reap(cache_key)
 
 
 def cleanup_inactive_sessions() -> None:

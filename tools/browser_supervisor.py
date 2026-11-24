@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
+from tools.bot_desktop.lease import executor_outcome_unknown
 from tools.browser_supervisor_dialogs import (
     DEFAULT_DIALOG_POLICY, DEFAULT_DIALOG_TIMEOUT_S, RECENT_DIALOGS_MAX, _VALID_POLICIES, DialogRecord,
     DialogSupervisionMixin, PendingDialog,
@@ -238,6 +239,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         try:
             response = _run_eval(return_by_value)
         except Exception as exc:
+            executor_outcome_unknown()
             # Deep-serializing live DOM nodes / NodeLists / Window can blow past
             # CDP's recursion guard (``Object reference chain is too long``).
             # Retry once with returnByValue=False so Chrome returns the description.

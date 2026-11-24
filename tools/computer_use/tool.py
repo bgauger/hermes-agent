@@ -291,7 +291,6 @@ def handle_computer_use(args: dict[str, Any], **kwargs) -> Any:
         admitted = _bd_lease.assert_agent_may_act()
     except _bd_lease.HumanHasControl as e:
         return _refused(e)
-    _bd_ensure_started()  # headless gateway: bring the profile's screen up before the backend probes DISPLAY
     if (err := _reject_unsafe(action, args)) is not None:
         return err
     scopes = ([action] if action in _ACTIONS and _ACTIONS[action].destructive else []) + (
@@ -299,44 +298,50 @@ def handle_computer_use(args: dict[str, Any], **kwargs) -> Any:
     for scope in scopes:
         if (err := _request_approval(scope, args)) is not None:
             return err
-    # Acquire separately so startup errors retain the install hint; the stack
-    # releases the admitted call lock on every dispatch return or exception.
-    call = contextlib.ExitStack()
     try:
-        backend = call.enter_context(_backend_for_call(session_id))
-    except Exception as e:
-        from plugins.computer_use import DEFAULT_BACKEND, configured_backend_name
-        hint = ({"hint": "If the cua-driver binary is missing, run `hermes computer-use install`. If a Python "
-                         "dependency is missing, the error above shows the exact install command."}
-                if configured_backend_name() == DEFAULT_BACKEND else {})
-        return json.dumps({"error": f"computer_use backend unavailable: {e}", **hint})
-    try:
-        with call:
-            # Re-check under the dispatch lock: approval, backend start-up and lock waits above can take
-            # seconds, and a human may have taken over meanwhile. A result produced after such a flip is
-            # discarded too — it may picture what they typed.
+        with _bd_lease.admitted_action():
+            _bd_ensure_started()
+            call = contextlib.ExitStack()
             try:
-                _bd_lease.assert_agent_may_act()
-            except _bd_lease.HumanHasControl as e:
-                return _refused(e)
-
-            def _fence() -> None:
-                # Any lease transition since admission voids the frame — including a full take-over /
-                # hand-back cycle that already finished: it still belongs to the human's turn. Capture
-                # paths call this BEFORE the frame is persisted, spilled or sent to auxiliary vision.
-                if _bd_lease.get().epoch != admitted.epoch:
-                    raise _bd_lease.HumanHasControl(
-                        "A human took over this desktop while the action ran; its result was discarded. "
-                        "Tell the user what you need and re-capture once they hand back.")
-            _fence()  # input actions never receive fence=; refuse before the device op starts
-            result = _dispatch(backend, action, args, fence=_fence, session_id=session_id or None)
-            _fence()
-            return result
+                backend = call.enter_context(_backend_for_call(session_id))
+            except Exception as e:
+                _bd_lease.executor_outcome_unknown()
+                from plugins.computer_use import DEFAULT_BACKEND, configured_backend_name
+                hint = ({"hint": "If the cua-driver binary is missing, run `hermes computer-use install`. If a Python "
+                                 "dependency is missing, the error above shows the exact install command."}
+                        if configured_backend_name() == DEFAULT_BACKEND else {})
+                return json.dumps({"error": f"computer_use backend unavailable: {e}", **hint})
+            with call:
+                try:
+                    result = _dispatch_with_epoch(backend, action, args, admitted.epoch, session_id)
+                except _bd_lease.HumanHasControl as exc:
+                    result = _refused(exc)
+        if _bd_lease.get().epoch != admitted.epoch:
+            return _refused(_bd_lease.HumanHasControl("Desktop control changed; the action result was discarded."))
+        return result
     except _bd_lease.HumanHasControl as e:
         return _refused(e)
     except Exception as e:
         logger.exception("computer_use %s failed", action)
         return json.dumps({"error": f"{action} failed: {e}"})
+
+
+def _dispatch_with_epoch(backend, action, args, epoch, session_id):
+    from tools.bot_desktop import lease as _bd_lease
+
+    def _fence() -> None:
+        # Any lease transition since admission voids the frame — including a full take-over /
+        # hand-back cycle that already finished: it still belongs to the human's turn. Capture
+        # paths call this BEFORE the frame is persisted, spilled or sent to auxiliary vision.
+        if _bd_lease.get().epoch != epoch:
+            raise _bd_lease.HumanHasControl(
+                "A human took over this desktop while the action ran; its result was discarded. "
+                "Tell the user what you need and re-capture once they hand back.")
+    _fence()  # input actions never receive fence=; refuse before the device op starts
+    result = _dispatch(backend, action, args, fence=_fence, session_id=session_id or None)
+    _fence()
+    return result
+
 
 def _request_approval(action: str, args: dict[str, Any]) -> Optional[str]:
     """None if approved, else a JSON error string. The decision (yolo bypass, session/permanent grants, CLI prompt,

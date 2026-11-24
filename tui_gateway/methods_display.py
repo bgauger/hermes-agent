@@ -99,7 +99,11 @@ def _(rid, params: dict) -> dict:
     force = bool(params.get("force"))
     # Refusal and release are ONE lease transition: a takeover landing between a separate human_holds()
     # check and the release would be acknowledged to the human and then silently revoked here.
-    if _bd_lease.release(unless_human=not force).holder == _bd_lease.HUMAN:
+    held = _bd_lease.release(unless_human=not force)
+    if held.handback_pending:
+        return _err(rid, _DISPLAY_ERR, "The desktop input executor has not acknowledged input.",
+                    data={"code": "handback_pending", "lease": _bd_lease.public_view(held)})
+    if held.holder == _bd_lease.HUMAN:
         return _err(rid, _DISPLAY_ERR, "a human holds this screen; pass force: true to stop it anyway",
                     data={"code": "viewer_mismatch"})
     try:
@@ -250,6 +254,12 @@ def _(rid, params: dict) -> dict:
     # the human who just took it.
     _bd_runtime.touch_activity()
     lease = _bd_lease.acquire(viewer_id, reason=str(params.get("reason") or ""))
+    if lease.input_unconfirmed and lease.viewer_id != viewer_id:
+        return _err(rid, _DISPLAY_ERR, "Takeover pending. The prior viewer's input has not been acknowledged.",
+                    data={"code": "takeover_pending", "lease": _bd_lease.public_view(lease)})
+    if lease.pending:
+        return _err(rid, _DISPLAY_ERR, "Takeover pending. Screen executor activity has not settled.",
+                    data={"code": "takeover_pending", "lease": _bd_lease.public_view(lease)})
     return _ok(rid, {"lease": _bd_lease.public_view(lease)})
 
 
@@ -264,6 +274,9 @@ def _(rid, params: dict) -> dict:
         return refused
     # Same atomicity as display.stop: the "is a human holding?" decision happens inside the transition.
     lease = _bd_lease.release(viewer_id, unless_human=viewer_id is None and not params.get("force"))
+    if lease.handback_pending:
+        return _err(rid, _DISPLAY_ERR, "Hand-back pending. The desktop input executor has not acknowledged input.",
+                    data={"code": "handback_pending", "lease": _bd_lease.public_view(lease)})
     if viewer_id is None and lease.holder == _bd_lease.HUMAN:
         return _err(rid, _DISPLAY_ERR, "viewer_id required to release another viewer's lease (or pass force: true)",
                     data={"code": "viewer_mismatch"})

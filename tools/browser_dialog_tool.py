@@ -70,6 +70,12 @@ def browser_dialog(
     task_id: Optional[str] = None,
 ) -> str:
     """Respond to a pending dialog on the active task's CDP supervisor."""
+    from tools.bot_desktop.lease import explicit_release_applies
+    from tools.registry import tool_error
+
+    if explicit_release_applies():
+        return tool_error("browser_dialog is unavailable with Bot Desktop explicit release. Use browser_exec.",
+                          code="exclusive_desktop_route")
     supervisor = SUPERVISOR_REGISTRY.get(task_id or "default")
     if supervisor is None:
         return json.dumps({

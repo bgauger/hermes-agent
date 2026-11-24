@@ -696,8 +696,13 @@ def _fenced_page_op(task_id: Optional[str], fn) -> str:
     """Vault operations focus, inspect and fill the page over the supervisor socket, bypassing
     browser_exec; they must honour the Bot Desktop lease like every other page access, or a human
     typing a credential on the taken-over screen could be read or written to."""
+    from tools.bot_desktop.lease import explicit_release_applies
+    from tools.registry import tool_error
     from tools.browser_session import run_fenced, session_for_task
 
+    if explicit_release_applies():
+        return tool_error("Browser vault page operations are unavailable with Bot Desktop explicit release.",
+                          code="exclusive_desktop_route")
     res = run_fenced(session_for_task(task_id), lambda: {"raw": fn()})
     return res["raw"] if "raw" in res else json.dumps(res)
 

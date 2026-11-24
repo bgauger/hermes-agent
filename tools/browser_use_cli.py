@@ -629,11 +629,14 @@ _real_profile_note_delivered: set = set()
 
 
 def stop_harness_daemons(home_key: Optional[str] = None) -> None:
-    """Stop every harness daemon this process drove (only ``home_key``'s when given), through the
-    harness's own identity-checked ``--reload``; the next browser_exec respawns one on the endpoint
-    it resolves then."""
+    """Reload legacy daemons. Explicit-release daemons can outlive this worker while a viewer uses
+    the desktop and while a prior executor outcome remains unknown."""
+    from tools.bot_desktop.lease import explicit_release_applies
+
     with _driven_daemons_lock:
-        daemons = sorted(key for key, home in _driven_daemons.items() if home_key in (None, home))
+        candidates = sorted((key, home) for key, home in _driven_daemons.items() if home_key in (None, home))
+    daemons = [key for key, home in candidates if not explicit_release_applies(home)]
+    with _driven_daemons_lock:
         for key in daemons:
             _driven_daemons.pop(key, None)
     _reload_daemons(daemons)
@@ -691,7 +694,9 @@ def _own_harness_daemon(env: dict) -> Optional[bool]:
 
     Returns True once the daemon is owned, False when it can never be (Windows, a managed worker, a
     daemon another Hermes started), None when there is nothing to own yet."""
-    if os.name != "posix":
+    from tools.bot_desktop.lease import explicit_release_applies
+
+    if explicit_release_applies() or os.name != "posix":
         return False  # Windows: the harness daemon is outside this process's job; nothing to register.
     from agent.runtime_session_store import is_worker_process
     if is_worker_process():
@@ -805,18 +810,70 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         return tool_error("browser-harness is missing from Hermes's Python environment. "
                           "Run `hermes update` to re-sync it.")
 
+    if session and not _SESSION_RE.match(session):
+        return tool_error(f"Invalid session name {session!r}: use 1-64 letters, digits, "
+                          "dashes, or underscores (e.g. 'r7k2').")
+    from tools.bot_desktop.lease import explicit_release_applies
+    from tools.browser_session import run_fenced
+
+    def dispatch() -> dict[str, Any]:
+        return _dispatch_browser_exec(cmd, code, task_id, session, bool(local),
+                                      local_sidecar, route_key, timeout_s, exclusive)
+
+    exclusive = explicit_release_applies()
+    started = time.time()
+    dispatched = run_fenced({"features": {"local": True}}, dispatch) if exclusive else dispatch()
+    if "proc" not in dispatched:
+        if "error_result" in dispatched:
+            return dispatched["error_result"]
+        return tool_result(dispatched)
+    proc = dispatched["proc"]
+
+    # browser_vault fill registers injected values with this forced model-egress
+    # boundary. Preserve raw stdout only for screenshot-path detection below.
+    result = {
+        "success": proc.returncode == 0,
+        "exit_code": proc.returncode,
+        "output": redact_sensitive_text(proc.stdout, force=True),
+    }
+    if workspace := dispatched["workspace"]:
+        result["workspace"] = workspace
+    if session:
+        result["session"] = session
+    result.update(_take_real_profile_note(route_key))
+    stderr = redact_sensitive_text((proc.stderr or "").strip(), force=True)
+    if len(stderr) > _STDERR_CAP_CHARS:
+        stderr = stderr[:_STDERR_CAP_CHARS] + "\n… (stderr truncated)"
+    if stderr:
+        result["stderr"] = stderr
+    screenshot = _find_screenshot(proc.stdout, started)
+    if screenshot:
+        result["screenshot_path"] = screenshot
+        native = _native_screenshot_result(result, screenshot)
+        if native is not None:
+            return native
+    return tool_result(result)
+
+
+def _dispatch_browser_exec(cmd: list[str], code: str, task_id: Optional[str], session: str, local: bool,
+                           local_sidecar: bool, route_key: str, timeout_s: Any,
+                           exclusive: bool) -> dict[str, Any]:
+    from tools.bot_desktop.lease import executor_outcome_unknown
+    from tools.browser_session import run_fenced
+    from tools.registry import tool_error
+
     env = _base_subprocess_env()
     if session:
-        if not _SESSION_RE.match(session):
-            return tool_error(f"Invalid session name {session!r}: use 1-64 letters, digits, "
-                              "dashes, or underscores (e.g. 'r7k2').")
         env["BU_NAME"] = session
     env, route_err, local_sidecar, generation = _route_exec_current(
-        env, session, task_id, bool(local), local_sidecar, route_key)
+        env, session, task_id, local, local_sidecar, route_key)
     if route_err:
-        return tool_error(route_err)
+        return {"error_result": tool_error(route_err)}
     if local_sidecar:
         env["BU_NAME"] = _sidecar_daemon_name(session)
+    if exclusive:
+        endpoint = env.get("BU_CDP_WS") or env.get("BU_CDP_URL") or ""
+        namespace_harness_dirs(env, f"explicit-release\0{hermes_home_key()}\0{endpoint}")
     _exec_route_is_sidecar[route_key] = local_sidecar
     local_engine = env.pop(_BOT_DESKTOP_BROWSER_SENTINEL, None)
     bot_desktop_browser = bool(local_engine)
@@ -842,68 +899,43 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         env["BU_AUTOSPAWN"] = "1"
 
     timeout = _clamp_timeout(timeout_s)
-    started = time.time()
 
     def dispatch() -> dict[str, Any]:
-        _attach_vault_supervisor(env, task_id)
+        if not exclusive:
+            _attach_vault_supervisor(env, task_id)
         with _driven_daemons_lock:
             daemon = daemon_identity(env)
             _driven_daemons[daemon] = hermes_home_key()
         # The first call starts the daemon and may run long (navigation, user code): own it as soon as
         # it publishes its pid, so a Hermes killed mid-call takes it along (the call's end owns it too).
         from agent.periodic_scheduler import schedule
-        owning = schedule(lambda: _own_harness_daemon_until_owned(env), _OWN_DURING_CALL_S)
+        owning = None if exclusive else schedule(lambda: _own_harness_daemon_until_owned(env), _OWN_DURING_CALL_S)
         try:
-            return {"proc": _run_cli_killing_process_group(cmd, code, env, timeout)}
+            proc = _run_cli_killing_process_group(cmd, code, env, timeout)
+            if proc.returncode != 0:
+                executor_outcome_unknown()
+            return {"proc": proc, "workspace": workspace}
         except subprocess.TimeoutExpired:
+            executor_outcome_unknown()
             return {"error_result": tool_error(
                 f"browser-use exec timed out after {timeout}s. The daemon may still be working; retry "
                 f"with a larger timeout_s (max {_MAX_TIMEOUT_S}), or split the work into several calls that "
                 "append to workspace files — anything already written to the workspace is preserved."
             )}
         except OSError as e:
+            executor_outcome_unknown()
             return {"error_result": tool_error(f"Failed to launch browser-use CLI: {e}")}
         finally:
-            owning.cancel(wait=5)  # an in-flight check finishes before the post-call one runs
-            _record_driven_tab(env, task_id)  # only a call that ran: the supervisor is this call's browser's
+            if owning is not None:
+                owning.cancel(wait=5)  # an in-flight check finishes before the post-call one runs
+            if not exclusive:
+                _record_driven_tab(env, task_id)
+                _own_harness_daemon(env)
+            _reload_if_republished(env, generation)
 
-    if bot_desktop_browser:
-        from tools.browser_session import run_fenced
-        dispatched = run_fenced({"features": {"local": True}}, dispatch)
-    else:
-        dispatched = dispatch()
-    _reload_if_republished(env, generation)
-    _own_harness_daemon(env)
-    if "proc" not in dispatched:
-        if "error_result" in dispatched:
-            return dispatched["error_result"]
-        return tool_result(dispatched)
-    proc = dispatched["proc"]
-
-    # browser_vault fill registers injected values with this forced model-egress
-    # boundary. Preserve raw stdout only for screenshot-path detection below.
-    result = {
-        "success": proc.returncode == 0,
-        "exit_code": proc.returncode,
-        "output": redact_sensitive_text(proc.stdout, force=True),
-    }
-    if workspace:
-        result["workspace"] = workspace
-    if session:
-        result["session"] = session
-    result.update(_take_real_profile_note(route_key))
-    stderr = redact_sensitive_text((proc.stderr or "").strip(), force=True)
-    if len(stderr) > _STDERR_CAP_CHARS:
-        stderr = stderr[:_STDERR_CAP_CHARS] + "\n… (stderr truncated)"
-    if stderr:
-        result["stderr"] = stderr
-    screenshot = _find_screenshot(proc.stdout, started)
-    if screenshot:
-        result["screenshot_path"] = screenshot
-        native = _native_screenshot_result(result, screenshot)
-        if native is not None:
-            return native
-    return tool_result(result)
+    if bot_desktop_browser and not exclusive:
+        return run_fenced({"features": {"local": True}}, dispatch)
+    return dispatch()
 
 
 _HEADER_BASE = (

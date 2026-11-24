@@ -133,6 +133,11 @@ def ensure_cdp_supervisor(task_id: str) -> None:
     """Start the CDP supervisor for ``task_id`` when an endpoint is reachable (idempotent; restarts on a
     URL change). URL precedence: the CDP override, then the session's own ``cdp_url``. A failed attach
     never breaks the session."""
+    from tools.bot_desktop.lease import explicit_release_applies
+
+    # The supervisor has autonomous dialog and reconnect work outside an action ticket.
+    if explicit_release_applies():
+        return
     cdp_url = get_cdp_override()
     if not cdp_url:
         from tools import browser_session as _bs

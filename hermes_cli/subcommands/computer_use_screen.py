@@ -48,12 +48,14 @@ def _screen_start(args) -> int:
 
 
 def _screen_stop(args) -> int:
-    from tools.bot_desktop import runtime
-    if runtime.is_supported_host():
-        # Same door as display.stop: a human mid-takeover is never yanked by a runbook or a stray
-        # `screen stop`; the decision is taken under the lease lock so a takeover cannot race it.
-        from tools.bot_desktop import lease
-        if lease.release(unless_human=not bool(getattr(args, "force", False))).holder == lease.HUMAN:
+    from tools.bot_desktop import lease, runtime
+    if runtime.is_supported_host() or lease.explicit_release_applies():
+        # A Mac can own the lease for a terminal-hosted screen.
+        held = lease.release(unless_human=not bool(getattr(args, "force", False)))
+        if held.handback_pending:
+            print("Bot Desktop: the desktop input executor has not acknowledged input.")
+            return 1
+        if held.holder == lease.HUMAN:
             print("Bot Desktop: a human holds this screen; re-run with --force to take it down anyway.")
             return 1
     print("Bot Desktop: stopped" if runtime.stop() else "Bot Desktop: was not running")

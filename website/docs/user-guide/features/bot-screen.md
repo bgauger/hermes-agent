@@ -158,7 +158,7 @@ Every bot's computer is one click away in three places of Hermes Desktop:
 3. Click **Take over**. The border turns red, your keyboard and mouse now drive
    the bot's screen. Sign in, solve the CAPTCHA, approve the payment.
 4. Click **Hand back**. The bot regains control and re-captures the screen
-   before continuing. Closing the pane also hands control back. A *dropped*
+   before continuing. With the default settings, closing the pane also hands control back. A *dropped*
    connection is different: if your laptop lid closes or Wi-Fi drops while you
    hold control, you keep it — the bot stays locked out of a screen you may be
    mid-login on — until you reconnect and hand back. If you come back after a
@@ -343,8 +343,38 @@ bot_desktop:
   auto_start: false         # set true to start on the first computer_use call or headed browser use
   min_free_memory_mb: 1536  # refuse to start below this much free memory (0 = never check)
   idle_stop_minutes: 30     # stop a screen nobody used for this long (0 = keep it up)
+  explicit_release: false   # set true to keep human control until Hand back
   placement: auto           # auto | terminal | gateway — see "Where the screen runs"
 ```
+
+Set `bot_desktop.explicit_release: true` in the profile that owns the lease
+(the Mac profile when its screen runs over SSH). The next **Take over** saves
+the policy in that lease. Clean pane closure, dropped connections, idle checks,
+and process restarts preserve it. A held screen is exempt from idle auto-stop.
+
+**Take over** closes admission for computer-use actions and `browser_exec`,
+including browser startup, replacement, CDP override routing and attachment.
+The viewer can send keyboard, pointer and clipboard input once every admitted
+action reports completion. A timeout, lost reply or caller exit can leave a
+durable action record and keep the takeover pending. The explicit-release
+profile refuses raw CDP, the separate browser dialog tool and browser vault
+page operations because those routes use an independent CDP connection or
+supervisor. Select any CDP override in the profile configuration before
+starting the worker. Live `/browser connect` and `disconnect` are refused
+under this policy.
+
+**Hand back** can return control immediately if the viewer sent no input.
+After input, hand-back stays pending and further screen actions are blocked.
+The RFB bridge records input before forwarding it. It needs an acknowledgement
+from the desktop input executor, ordered after the last input for that lease,
+before it can reopen agent admission. The current bridge has no such
+acknowledgement. A relay queue drain, disconnect or restart cannot provide it.
+There is also no automatic recovery for an action whose executor can no longer
+report its outcome.
+
+Load the same code in all profile workers, the gateway, the WebSocket bridge
+and the idle watcher before enabling the policy. The acknowledgement gap
+blocks interactive rollout.
 
 `auto_start` is off by default. Start the screen from the Desktop's Screen
 pane (**Start screen**), from `hermes computer-use screen start`, or set the
@@ -396,7 +426,8 @@ Xauthority, launcher log, per-profile xfconf).
   while you hold control. Type passwords with that in mind, or change the layout
   with `setxkbmap` on that `DISPLAY`.
 - **Bot says `human_has_control` after you left** — click **Hand back** in the
-  pane (or **Hand back (force)** after a reload). From a shell,
+  pane (or **Hand back (force)** after a reload). If hand-back is pending input
+  acknowledgement, force cannot settle the input. For the default policy, from a shell,
   `hermes computer-use screen stop --force` releases the lease and stops the
   screen (without `--force` the command refuses while a human holds control, so a
   runbook can never yank a live takeover); `hermes computer-use screen start`

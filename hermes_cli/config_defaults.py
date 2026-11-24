@@ -2468,13 +2468,13 @@ DEFAULT_CONFIG = {
         # Refuse to start below this much free memory (MB), measured on the host or its container cgroup,
         # whichever is tighter. Xvnc + Xfce idle at ~220 MB and a takeover's browser adds 0.5-1 GB, so a
         # screen with one page runs past 1 GB; the kernel OOM killer picks its victim by score, so on a
-        # small instance the loser is the dashboard or the gateway rather than the desktop. 0 disables the
-        # check.
+        # small instance an abandoned screen can cost the dashboard or gateway. 0 disables the check.
         "min_free_memory_mb": 1536,
-        # Stop a screen nobody has used (no computer_use action, browser spawn, viewer or takeover) for this
-        # long; it restarts on the next use. Idle Xvnc + Xfce hold ~220 MB, an abandoned browser far more.
-        # 0 keeps screens up until stopped.
+        # Stop an idle screen and restart it on next use. Computer use, browser starts, viewing and
+        # takeover all count as use. 0 keeps the screen up until stopped.
         "idle_stop_minutes": 30,
+        # Require Hand back after disconnect. Unacknowledged input keeps hand-back pending.
+        "explicit_release": False,
         # Where the screen (and with it computer_use and the bot's browser) runs.
         #   auto      follow the terminal backend: inside the docker / ssh / streaming plugin sandbox when one is
         #             configured, on the gateway host when terminal.backend is local. A sandbox backend that

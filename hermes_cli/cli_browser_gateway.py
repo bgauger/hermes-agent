@@ -1,12 +1,14 @@
-"""Classic CLI ``/browser`` on the shared gateway (#134889 CLI-9): ``browser.manage``, as Ink and
-Desktop send it. Split from ``cli_commands_mixin`` (the file is over its size target)."""
+"""Classic CLI ``/browser``: shared-gateway RPCs and local debug-browser launch."""
 from __future__ import annotations
 
 import os
+import time
 from urllib.parse import urlparse
 
-from hermes_cli.browser_connect import DEFAULT_BROWSER_CDP_URL
-from hermes_cli.cli_commands_session_tools import _say_block, _t
+from hermes_cli.browser_connect import (
+    DEFAULT_BROWSER_CDP_URL, discover_local_cdp_url, find_free_debug_port,
+    launch_chrome_debug, local_port_in_use, manual_chrome_debug_command)
+from hermes_cli.cli_commands_session_tools import _pr, _say_block, _t
 
 
 def _gateway_is_remote() -> bool:
@@ -72,3 +74,34 @@ def _normalize_cdp_url(cdp_url: str):
         return parsed.geturl(), port
     return parsed._replace(path="", params="", query="", fragment="").geturl(), port
 
+
+
+def launch_default_cdp_browser(port: int):
+    """Launch a local debug browser for the default CDP URL; returns the discovered CDP url or
+    None (after printing what went wrong / how to launch manually)."""
+    launch_port = port
+    if local_port_in_use(port):
+        launch_port = find_free_debug_port(port)
+        _pr(f"   {_t('browser.port_occupied', port=port)}",
+            f"     {_t('browser.port_occupied_detail', launch_port=launch_port)}")
+    else:
+        print(f"   {_t('browser.launching')}")
+    launch = launch_chrome_debug(launch_port)
+    if not launch.launched:
+        print(f"   {_t('browser.launch_failed')}")
+        if launch.hint:
+            print(f"     {launch.hint}")
+        chrome_cmd = manual_chrome_debug_command(launch_port)
+        if chrome_cmd:
+            _pr(f"     {_t('browser.launch_manually')}", f"     {chrome_cmd}")
+        else:
+            print(f"     {_t('browser.no_executable')}")
+        return None
+    for _wait in range(10):  # wait for the DevTools discovery endpoint to come up
+        found = discover_local_cdp_url(launch_port, timeout=1.0)
+        if found:
+            print(f"   {_t('browser.launched', port=launch_port)}")
+            return found
+        time.sleep(0.5)
+    _pr(f"   {_t('browser.not_responding', port=launch_port)}", f"     {_t('browser.try_again')}")
+    return None

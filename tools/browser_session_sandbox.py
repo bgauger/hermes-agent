@@ -121,10 +121,16 @@ def _start_chromium(env, user, exe: str, udd: str, child_env: dict) -> tuple[int
     # Chromium itself, and its start time is fixed from the fork on.
     script = (f"mkdir -p {shlex.quote(udd)} && rm -f {shlex.quote(udd)}/DevToolsActivePort && "
               f"(setsid {shlex.join(argv)} >/dev/null 2>&1 & p=$!; echo \"$p $({_START_TIME_OF_P})\")")
-    proc = streams.run_in(env, ["bash", "-c", script], child_env=child_env, user=user, timeout=30)
+    from tools.bot_desktop.lease import executor_outcome_unknown
+    try:
+        proc = streams.run_in(env, ["bash", "-c", script], child_env=child_env, user=user, timeout=30)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        executor_outcome_unknown()
+        raise
     last = proc.stdout.decode("utf-8", "replace").strip().splitlines()[-1:] if proc.returncode == 0 else []
     words = last[0].split() if last else []
     if not words or not words[0].isdigit():
+        executor_outcome_unknown()
         raise RuntimeError(f"Chromium could not be started in the sandbox: {proc.stderr.decode('utf-8', 'replace')[-500:]}")
     start = words[1] if len(words) > 1 and words[1].isdigit() else None
     return int(words[0]), start
@@ -166,6 +172,7 @@ def _spawn_owned(env, user, udd: str, key: str, published: dict) -> int:
 def create_sandbox_session(cache_key: str) -> dict[str, Any]:
     """Session on the sandbox Chromium (attach to the running one, else launch it)."""
     from tools.bot_desktop import sandbox_host
+    from tools.bot_desktop.lease import explicit_release_applies, executor_outcome_unknown
     from tools.browser_session import _session_record
     from tools.environments import streams
     env, published = _sandbox()
@@ -185,9 +192,15 @@ def create_sandbox_session(cache_key: str) -> dict[str, Any]:
                 found = _wait_for_port(env, user, udd)
             local_port = streams.forward_port(env, found[0], user=user)
         except BaseException:
-            if spawned is not None:  # a timeout, a failed forward or an interrupt must not leave it running unowned
+            if spawned is not None:
+                # The remote rollback sends SIGTERM but does not observe process exit.
+                executor_outcome_unknown()
                 _stop_launched(key)
             raise
+        if spawned is not None and explicit_release_applies():
+            # The detached browser now belongs to the sandbox, which outlives this worker.
+            with _launched_lock:
+                _launched.pop(key, None)
     info = _session_record("sb", f"ws://127.0.0.1:{local_port}{found[1]}", {"local": True, "sandbox": True})
     _confirm(info["cdp_url"], env, found[0])
     info.update(shared_profile=True, launcher_key=key)
@@ -256,6 +269,8 @@ def _stop_launched(key: str) -> None:
     try:
         proc = streams.run_in(env, argv, user=sandbox_host._user_for(env), timeout=15)
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        from tools.bot_desktop.lease import executor_outcome_unknown
+        executor_outcome_unknown()
         logger.debug("sandbox browser stop for pid %s failed: %s", pid, exc)
         return
     if proc.returncode == _NOT_OURS_RC:
